@@ -1,272 +1,194 @@
-import asyncio
-import logging
-import sqlite3
-import sys
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+import os, io, asyncio, sqlite3
+from pathlib import Path
+from datetime import datetime
 from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.types import (
+    Message, KeyboardButton, ReplyKeyboardMarkup, BufferedInputFile,
+    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+import config
 
-from config import ADMIN_IDS, BOT_TOKEN, DB_PATH
+DB = Path(__file__).with_name(config.DB_PATH)
 
-logging.basicConfig(level=logging.INFO)
+MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 ثبت فروش"), KeyboardButton(text="📊 گزارش")],
+        [KeyboardButton(text="📦 لیست منو"), KeyboardButton(text="🧮 موجودی انبار")],
+        [KeyboardButton(text="💸 ثبت هزینه"), KeyboardButton(text="📤 خروجی Excel")]
+    ],
+    resize_keyboard=True
+)
 
-# دیتابیس
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS inventory (
-            name TEXT PRIMARY KEY,
-            qty REAL,
-            unit TEXT,
-            min_qty REAL
-        )"""
-    )
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS recipes (
-            item_name TEXT,
-            ingredient TEXT,
-            amount REAL
-        )"""
-    )
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS sales (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_name TEXT,
-            qty REAL,
-            total_price REAL,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )"""
-    )
-    cursor.execute(
-        """CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            amount REAL,
-            date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )"""
-    )
-    conn.commit()
-    conn.close()
+# لیست تمام آیتم‌های استخراج شده از عکس‌های منوی کافه مور
+INITIAL_MENU = {
+    "نوشیدنی گرم بر پایه قهوه": [
+        ("اسپرسو سینگل", 160000), ("اسپرسو دوبل", 180000), ("اسپرسو سینامون", 190000),
+        ("اسپرسو ماکیاتو", 185000), ("کاپوچینو", 210000), ("لاته", 230000),
+        ("لاته طعم‌دار", 255000), ("آمریکانو", 205000), ("موکا", 255000),
+        ("فلت وایت", 210000), ("کورتادو", 190000), ("کارامل ماکیاتو", 255000),
+    ],
+    "سرد بر پایه قهوه": [
+        ("آیس لاته", 250000), ("آیس موکا", 270000), ("آیس کارامل ماکیاتو", 270000),
+        ("آیس آمریکانو", 210000), ("آیس لاته طعم‌دار", 270000),
+    ],
+    "هات‌نوش و ترکیبی": [
+        ("قهوه ترک", 180000), ("قهوه یونانی", 195000), ("وانیلا گریک", 205000),
+        ("پرشین", 235000), ("هات چاکلت", 210000), ("وایت چاکلت", 210000),
+        ("پینک چاکلت", 210000), ("چای ماسالا", 200000), ("چای کرک", 210000),
+    ],
+    "چای و دمنوش": [
+        ("چای سیاه", 100000), ("دمنوش گل‌گاو‌زبان", 155000), ("دمنوش چای ترش", 160000),
+        ("دمنوش عناب و آویشن", 155000), ("دمنوش بابونه", 155000), ("دمنوش لاغری", 155000),
+        ("دمنوش چای سبز", 160000), ("دمنوش ویتامین سی", 155000),
+    ],
+    "سرد بر پایه چای و میوه‌ای": [
+        ("آیس کرنبری", 190000), ("آیس توت‌فرنگی", 190000), ("آیس نارگیل", 190000),
+        ("آیس فندق", 190000), ("آیس وانیل", 190000), ("آیس میکس", 200000),
+        ("آیس چاکلت", 200000), ("آب هویج", 140000), ("شیک نوتلا", 220000),
+    ],
+    "کیک و دسر": [
+        ("کیک گردویی", 130000), ("کوکی شکلاتی", 130000), ("کوکی پسته", 150000),
+        ("پروتئین بار", 130000), ("کوکی براونی", 200000), ("کیک شکلاتی", 270000),
+        ("تارت پای سیب", 280000), ("براونی", 250000), ("تیرامیسو", 295000),
+        ("بادام تفت داده", 200000),
+    ]
+}
 
+def db():
+    c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); return c
 
-init_db()
+def setup():
+    with db() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS categories(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL);
+        CREATE TABLE IF NOT EXISTS items(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, category_id INTEGER REFERENCES categories(id), price REAL NOT NULL DEFAULT 0, stock REAL NOT NULL DEFAULT 999, unit TEXT NOT NULL DEFAULT 'عدد');
+        CREATE TABLE IF NOT EXISTS sales(id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER REFERENCES items(id), quantity REAL, unit_price REAL, total REAL, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS expenses(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, amount REAL, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS stock_log(id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER REFERENCES items(id), delta REAL, note TEXT, created_at TEXT);
+        """)
+        if c.execute("SELECT COUNT(*) FROM items").fetchone()[0] == 0:
+            for cat_name, items_list in INITIAL_MENU.items():
+                c.execute("INSERT OR IGNORE INTO categories(name) VALUES(?)", (cat_name,))
+                cat_id = c.execute("SELECT id FROM categories WHERE name=?", (cat_name,)).fetchone()[0]
+                for item_name, price in items_list:
+                    c.execute("INSERT INTO items(name, category_id, price, stock, unit) VALUES(?,?,?,?,?)", (item_name, cat_id, price, 999, "عدد"))
 
-# وضعیت‌های ربات
-class Form(StatesGroup):
-    waiting_for_input = State()
+def is_admin(user_id: int): return (not config.ADMIN_IDS) or (user_id in config.ADMIN_IDS)
+def tm(): return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+def kb_categories():
+    with db() as c: cats = c.execute("SELECT id, name FROM categories ORDER BY id").fetchall()
+    kb = [[InlineKeyboardButton(text=f"📂 {cat['name']}", callback_data=f"cat:{cat['id']}")] for cat in cats]
+    kb.append([InlineKeyboardButton(text="❌ انصراف", callback_data="cancel_sale")]); return InlineKeyboardMarkup(inline_keyboard=kb)
 
-router = Router()
+def kb_items_by_cat(cat_id: int):
+    with db() as c: items = c.execute("SELECT id, name, price FROM items WHERE category_id=?", (cat_id,)).fetchall()
+    kb = [[InlineKeyboardButton(text=f"{item['name']} | {int(item['price']):,} ت", callback_data=f"item:{item['id']}")] for item in items]
+    kb.append([InlineKeyboardButton(text="🔙 بازگشت به دسته‌ها", callback_data="back_to_cats")]); return InlineKeyboardMarkup(inline_keyboard=kb)
 
+def kb_quantity(item_id: int):
+    kb = [[InlineKeyboardButton(text=f"{n} عدد", callback_data=f"qty:{item_id}:{n}") for n in [1, 2, 3]],
+          [InlineKeyboardButton(text=f"{n} عدد", callback_data=f"qty:{item_id}:{n}") for n in [4, 5]],
+          [InlineKeyboardButton(text="✍️ تعداد دیگر", callback_data=f"custom_qty:{item_id}")],
+          [InlineKeyboardButton(text="🔙 بازگشت", callback_data="back_to_cats")]]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def is_admin(user_id: int) -> bool:
-    if not ADMIN_IDS:
-        return True
-    return user_id in ADMIN_IDS
+class S(StatesGroup): qty = State(); exp = State()
 
+async def handle_ping(request): return web.Response(text="MoRe Coffee Bot is Live!")
+async def start_webserver():
+    app = web.Application(); app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080))).start()
 
-def main_menu():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📦 موجودی انبار", callback_data="inv"),
-                InlineKeyboardButton(text="⚠️ هشدارهای شارژ", callback_data="alerts"),
-            ],
-            [
-                InlineKeyboardButton(text="☕ ثبت فروش", callback_data="add_sale"),
-                InlineKeyboardButton(text="💸 ثبت هزینه", callback_data="add_expense"),
-            ],
-            [InlineKeyboardButton(text="📊 گزارش مالی", callback_data="report")],
-        ]
-    )
+async def start_cmd(m: Message):
+    if is_admin(m.from_user.id): await m.answer("☕ خوش آمدید به پنل مدیریت MoRe Coffee", reply_markup=MENU)
 
+async def start_sale(m: Message):
+    if is_admin(m.from_user.id): await m.answer("📋 دسته را انتخاب کنید:", reply_markup=kb_categories())
 
-@router.message(Command("start"))
-async def cmd_start(message: Message):
-    if not is_admin(message.from_user.id):
-        await message.answer("❌ شما دسترسی به این ربات ندارید.")
-        return
-    await message.answer(
-        "☕ به ربات مدیریت کافه **قهوه مور (MoRe Coffee)** خوش آمدید!\n\nلطفاً از منوی زیر یکی را انتخاب کنید:",
-        reply_markup=main_menu(),
-        parse_mode="Markdown",
-    )
+async def sale_callbacks(cb: CallbackQuery, state: FSMContext):
+    d = cb.data
+    if d == "cancel_sale": await cb.message.edit_text("❌ لغو شد.")
+    elif d == "back_to_cats": await cb.message.edit_text("📋 دسته را انتخاب کنید:", reply_markup=kb_categories())
+    elif d.startswith("cat:"): await cb.message.edit_text("☕ کالا را انتخاب کنید:", reply_markup=kb_items_by_cat(int(d.split(":")[1])))
+    elif d.startswith("item:"):
+        with db() as c: it = c.execute("SELECT name, price FROM items WHERE id=?", (int(d.split(":")[1]),)).fetchone()
+        await cb.message.edit_text(f"☕ <b>{it['name']}</b>\nقیمت: {int(it['price']):,} ت\nتعداد:", reply_markup=kb_quantity(int(d.split(":")[1])), parse_mode="HTML")
+    elif d.startswith("qty:"):
+        _, i_id, q = d.split(":"); i_id, q = int(i_id), float(q)
+        with db() as c:
+            it = c.execute("SELECT name, price FROM items WHERE id=?", (i_id,)).fetchone()
+            tot = q * it['price']
+            c.execute("UPDATE items SET stock=stock-? WHERE id=?", (q, i_id))
+            c.execute("INSERT INTO sales(item_id,quantity,unit_price,total,created_at) VALUES(?,?,?,?,?)", (i_id, q, it['price'], tot, tm()))
+        await cb.message.edit_text(f"✅ ثبت شد: {it['name']}\nتعداد: {int(q)}\nجمع: <b>{int(tot):,} تومان</b>", parse_mode="HTML")
+    elif d.startswith("custom_qty:"):
+        await state.update_data(i_id=int(d.split(":")[1])); await state.set_state(S.qty)
+        await cb.message.edit_text("تعداد را وارد کنید:")
+    await cb.answer()
 
-
-@router.callback_query(F.data == "inv")
-async def show_inventory(callback: Message):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT name, qty, unit, min_qty FROM inventory")
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        text = (
-            "📦 انبار خالی است.\nبرای اضافه کردن مواد اولیه از دکمه‌ها استفاده"
-            " کنید."
-        )
-    else:
-        text = "📦 **موجودی مواد اولیه انبار:**\n\n"
-        for r in rows:
-            text += f"• **{r[0]}**: {r[1]} {r[2]} (حداقل: {r[3]})\n"
-
-    await callback.message.edit_text(
-        text, reply_markup=main_menu(), parse_mode="Markdown"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "alerts")
-async def show_alerts(callback: Message):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT name, qty, unit, min_qty FROM inventory WHERE qty <= min_qty"
-    )
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        text = "✅ همه چیز مرتب است! هیچ موردی نیاز به شارژ فوری ندارد."
-    else:
-        text = "⚠️ **هشدار شارژ سریع مواد اولیه:**\n\n"
-        for r in rows:
-            text += f"• **{r[0]}**: موجودی فعلی {r[1]} {r[2]} (کمتر از حد مجاز!)\n"
-
-    await callback.message.edit_text(
-        text, reply_markup=main_menu(), parse_mode="Markdown"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "report")
-async def show_report(callback: Message):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT SUM(total_price) FROM sales")
-    total_sales = cursor.fetchone()[0] or 0
-
-    cursor.execute("SELECT SUM(amount) FROM expenses")
-    total_expenses = cursor.fetchone()[0] or 0
-    conn.close()
-
-    profit = total_sales - total_expenses
-    text = (
-        f"📊 **گزارش مالی کافه مور:**\n\n💰 کل فروش: `{total_sales:,.0f}` تومان\n💸"
-        f" کل هزینه‌ها: `{total_expenses:,.0f}` تومان\n────────────────\n🏷️"
-        f" سود خالص: `{profit:,.0f}` تومان"
-    )
-
-    await callback.message.edit_text(
-        text, reply_markup=main_menu(), parse_mode="Markdown"
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "add_sale")
-async def ask_sale(callback: Message, state: FSMContext):
-    await callback.message.answer(
-        "📝 لطفا فروش را به این صورت بفرستید:\n`نام آیتم, تعداد`\nمثال:\n`لاته,"
-        " 2`",
-        parse_mode="Markdown",
-    )
-    await state.set_state(Form.waiting_for_input)
-    await state.update_data(action="sale")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "add_expense")
-async def ask_expense(callback: Message, state: FSMContext):
-    await callback.message.answer(
-        "💸 لطفا هزینه را به این صورت بفرستید:\n`عنوان هزینه, مبلغ (تومان)`\nمثال:\n`خرید"
-        " شیر, 250000`",
-        parse_mode="Markdown",
-    )
-    await state.set_state(Form.waiting_for_input)
-    await state.update_data(action="expense")
-    await callback.answer()
-
-
-@router.message(Form.waiting_for_input)
-async def process_input(message: Message, state: FSMContext):
-    data = await state.get_data()
-    action = data.get("action")
-    text = message.text
-
+async def receive_qty(m: Message, state: FSMContext):
     try:
-        parts = [p.strip() for p in text.split(",")]
-        if action == "sale":
-            item_name = parts[0]
-            qty = float(parts[1])
-            # فرض قیمت پیش‌فرض هر آیتم برای تست
-            price = qty * 100000
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO sales (item_name, qty, total_price) VALUES (?, ?,"
-                " ?)",
-                (item_name, qty, price),
-            )
-            conn.commit()
-            conn.close()
-            await message.answer(
-                f"✅ فروش `{qty} عدد {item_name}` با موفقیت ثبت شد!",
-                reply_markup=main_menu(),
-                parse_mode="Markdown",
-            )
-        elif action == "expense":
-            title = parts[0]
-            amount = float(parts[1])
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO expenses (title, amount) VALUES (?, ?)",
-                (title, amount),
-            )
-            conn.commit()
-            conn.close()
-            await message.answer(
-                f"✅ هزینه `{title}` به مبلغ `{amount:,.0f}` تومان ثبت شد!",
-                reply_markup=main_menu(),
-                parse_mode="Markdown",
-            )
-    except Exception as e:
-        await message.answer(
-            "❌ فرمت وارد شده صحیح نیست. لطفاً مجدد تلاش کنید یا /start را بزنید."
-        )
+        q = float(m.text.strip())
+        data = await state.get_data(); i_id = data['i_id']
+        with db() as c:
+            it = c.execute("SELECT name, price FROM items WHERE id=?", (i_id,)).fetchone()
+            tot = q * it['price']
+            c.execute("UPDATE items SET stock=stock-? WHERE id=?", (q, i_id))
+            c.execute("INSERT INTO sales(item_id,quantity,unit_price,total,created_at) VALUES(?,?,?,?,?)", (i_id, q, it['price'], tot, tm()))
+        await state.clear(); await m.answer(f"✅ ثبت شد: {it['name']}\nتعداد: {q:g}\nجمع: {int(tot):,} ت", reply_markup=MENU)
+    except: await m.answer("عدد نامعتبر!")
 
-    await state.clear()
+async def list_items(m: Message):
+    with db() as c: rows = c.execute("SELECT i.name, i.price, c.name as cat FROM items i JOIN categories c ON i.category_id=c.id ORDER BY c.id").fetchall()
+    res = "📋 <b>منوی فعلی:</b>\n"
+    for r in rows: res += f"• {r['name']}: {int(r['price']):,} ت\n"
+    await m.answer(res, parse_mode="HTML")
 
+async def report_cmd(m: Message):
+    with db() as c:
+        s = c.execute("SELECT SUM(total) FROM sales").fetchone()[0] or 0
+        e = c.execute("SELECT SUM(amount) FROM expenses").fetchone()[0] or 0
+    await m.answer(f"📊 <b>گزارش:</b>\nفروش: {int(s):,} ت\nهزینه: {int(e):,} ت\nسود: {int(s-e):,} ت", parse_mode="HTML")
 
-# وب‌سرور کوچک برای راضی نگه داشتن Render
-async def handle_web(request):
-    return web.Response(text="MoRe Coffee Bot is running!")
+async def expense_cmd(m: Message, state: FSMContext):
+    await state.set_state(S.exp); await m.answer("شرح هزینه | مبلغ (مثلاً: شیر | 50000)")
 
+async def receive_exp(m: Message, state: FSMContext):
+    try:
+        t, a = m.text.split('|'); a = float(a.strip())
+        with db() as c: c.execute("INSERT INTO expenses(title,amount,created_at) VALUES(?,?,?)", (t.strip(), a, tm()))
+        await state.clear(); await m.answer("✅ ثبت شد.", reply_markup=MENU)
+    except: await m.answer("قالب اشتباه!")
 
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_web)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 10000)
-    await site.start()
-
+async def export_excel(m: Message):
+    from openpyxl import Workbook
+    wb = Workbook(); ws = wb.active; ws.title = "Sales"
+    ws.append(['کالا', 'تعداد', 'قیمت واحد', 'جمع', 'زمان'])
+    with db() as c:
+        for r in c.execute("SELECT i.name, s.quantity, s.unit_price, s.total, s.created_at FROM sales s JOIN items i ON i.id=s.item_id"):
+            ws.append(list(r))
+    buf = io.BytesIO(); wb.save(buf)
+    await m.answer_document(BufferedInputFile(buf.getvalue(), filename="More_Report.xlsx"))
 
 async def main():
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
-    dp.include_router(router)
-
-    # اجرای همزمان ربات تلگرام و وب‌سرور
-    await web_server()
+    setup(); await start_webserver()
+    bot = Bot(token=config.BOT_TOKEN); dp = Dispatcher()
+    dp.message.register(start_cmd, CommandStart())
+    dp.message.register(start_sale, F.text == "💰 ثبت فروش")
+    dp.message.register(list_items, F.text == "📦 لیست منو")
+    dp.message.register(report_cmd, F.text == "📊 گزارش")
+    dp.message.register(expense_cmd, F.text == "💸 ثبت هزینه")
+    dp.message.register(export_excel, F.text == "📤 خروجی Excel")
+    dp.callback_query.register(sale_callbacks)
+    dp.message.register(receive_qty, S.qty)
+    dp.message.register(receive_exp, S.exp)
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
